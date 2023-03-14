@@ -1,0 +1,436 @@
+ #!/bin/bash
+ 
+ # 安装工具包
+ install_package() { 
+     echo "-------安装工具包-------"
+     yum install -y expect
+     yum install -y epel-release
+     yum install -y psmisc nc net-tools rsync vim lrzsz ntp libzstd openssl-static tree iotop git dos2unix
+ }
+ # 统一配置hosts文件
+ modify_syshosts() { 
+     echo "-------修改hosts文件-------"
+     for hosts in 101 102 103 104 105 106
+     do 
+     echo "192.168.10."$hosts" hdp"$hosts"" >> /etc/hosts
+     done
+ }
+ 
+ #修改系统名称 同时修改hosts文件
+ modify_sysname() { 
+     echo "-------修改系统名称-------"
+     hostnamectl --static set-hostname $1
+ }
+  
+ #修改IP静态地址
+ modify_staticip() { 
+     echo "-------修改IP静态地址-------"
+     #先检查文件是否已被修改过
+     chk=`cat /etc/sysconfig/network-scripts/ifcfg-ens33 | grep static`
+     if [ "$chk" == "" ];then
+         #修改/etc/sysconfig/network-scripts/ifcfg-ens33文件中的dhcp
+         sed -i 's/dhcp/static/' /etc/sysconfig/network-scripts/ifcfg-ens33
+         echo "IPADDR=192.168.10.$1" >> /etc/sysconfig/network-scripts/ifcfg-ens33
+         echo "NETMASK=255.255.255.0" >> /etc/sysconfig/network-scripts/ifcfg-ens33
+         echo "GATEWAY=192.168.10.2" >> /etc/sysconfig/network-scripts/ifcfg-ens33
+         echo "DNS1=192.168.10.2" >> /etc/sysconfig/network-scripts/ifcfg-ens33
+         echo "PREFIX=24" >> /etc/sysconfig/network-scripts/ifcfg-ens33
+         systemctl restart network
+     else
+         sed -i "s/IPADDR=192.168.10.101/IPADDR=192.168.10."$1"/" /etc/sysconfig/network-scripts/ifcfg-ens33
+         systemctl restart network
+     fi
+ }
+  
+ #关闭防火墙
+ close_firewalld() { 
+     echo "-------关闭防火墙-------"
+     systemctl stop firewalld
+     systemctl disable firewalld
+ }
+  
+ #修改yum源为阿里源
+ modify_yumsource() { 
+     echo "-------修改yum源为阿里源-------"
+     # 检查是否已有备份文件 如果有则说明已经做过了
+     if [ -e /etc/yum.repos.d/CentOS-Base.repo_bak ];then
+         echo "don't nothing!"
+     else
+         #首先安装wget命令
+         yum install -y wget
+         #修改yum
+         cd /etc/yum.repos.d/
+         mv CentOS-Base.repo CentOS-Base.repo_bak
+         wget -O /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-7.repo
+         yum clean all
+         yum makecache
+     fi
+     cd /
+ }
+ 
+ # 创建用户并切换用户
+ add_user() { 
+     echo "请注意,在创建用户时会先对该用户进行删除操作以确保脚本运行成功, 如已有该用户请慎重输入用户名!"
+     read -p "继续请输入 1 ,停止请输入 2. : " IS_CONTINUE
+     if [ ${IS_CONTINUE} -ne 1 ]; then
+       echo "停止运行该脚本!"
+       exit
+     fi
+     read -p "请输入新增用户用户名 : " username
+     read -p "请输入新增用户密码 : " password
+     userdel -r ${username}
+     useradd -d /home/${username} ${username}
+     expect -c"
+      spawn passwd ${username}
+      expect {
+          "*yes/no*" {send "yes\r";exp_continue}
+          "*New password:*" {send "${password}\r";exp_continue}
+          "*Retype new password:*" {send "${password}\r";exp_continue}
+     }"
+     echo "配置新增用户root权限"
+     sed -i "93a "${username}" ALL=(ALL) NOPASSWD:ALL" /etc/sudoers
+     echo "创建software、module文件夹"
+     mkdir /opt/module /opt/software
+     chown ${username}:${username} /opt/module /opt/software
+     echo "切换用户"
+     su - ${username}
+ }
+  
+ #检查文件的文件夹是否存在不存在就创建1个
+ check_soft_folder() { 
+     echo "-------检查文件夹是否存在-------"
+     if [ -e /opt/module/$1 ];then
+         echo "/opt/module/$1 folder already exists"
+         rm -rf $1
+         return 1
+     else
+         mkdir /opt/module/$1
+         return 1
+     fi
+ }
+  
+ #安装JDK 软件目录必须在/opt/software下 jdk目录命名为jdk8
+ setup_jdk() { 
+     echo "-------安装JDK并配置环境变量-------"
+     #检查JDK是否已经安装过
+     check_soft_folder jdk8
+     if [ $? == 1 ];then
+         #在opt文件夹下搜索jdk的tar.gz文件
+         jdkName=`ls /opt/software/ | grep jdk*`
+         #将文件解压到对应的soft文件夹下
+         tar -zxvf /opt/software/$jdkName -C /opt/module/jdk8 --strip-components 1
+         #配置/etc/profile文件
+         sudo touch /etc/profile.d/my_env.sh
+         echo "配置jdk环境变量"
+         echo "" >> /etc/profile.d/my_env.sh
+         echo "#java environment" >> /etc/profile.d/my_env.sh
+         echo "export JAVA_HOME=/opt/module/jdk8" >> /etc/profile.d/my_env.sh
+         echo "export CLASSPATH=.:\${JAVA_HOME}/jre/lib/rt.jar:\${JAVA_HOME}/lib/dt.jar:\${JAVA_HOME}/lib/tools.jar" >> /etc/profile.d/my_env.sh
+         echo "export PATH=\$PATH:\${JAVA_HOME}/bin" >> /etc/profile.d/my_env.sh
+     fi
+ }
+ 
+ #安装Hadoop 软件目录必须在/opt/software下 hadoop目录命名为hadoop330
+ setup_hadoop() { 
+     echo "-------安装Hadoop并配置环境变量-------"
+     #检查JDK是否已经安装过
+     check_soft_folder hadoop330
+     if [ $? == 1 ];then
+         #在opt文件夹下搜索Hadoop的tar.gz文件
+         hadoopName=`ls /opt/software/ | grep hadoop*`
+         #将文件解压到对应的soft文件夹下
+         tar -zxvf /opt/software/$hadoopName -C /opt/module/hadoop330 --strip-components 1
+         #配置/etc/profile.d/my_env.sh文件
+         echo "配置hadoop环境变量"
+         echo "" >> /etc/profile.d/my_env.sh
+         echo "#hadoop environment" >> /etc/profile.d/my_env.sh
+         echo "export HADOOP_HOME=/opt/module/hadoop330" >> /etc/profile.d/my_env.sh
+         echo "export PATH=\$PATH:\${HADOOP_HOME}/bin" >> /etc/profile.d/my_env.sh
+         echo "export PATH=\$PATH:\${HADOOP_HOME}/sbin" >> /etc/profile.d/my_env.sh
+     fi
+ }
+ 
+ IP_LIST=(
+ hdp101
+ hdp102
+ hdp103
+ )
+ # 生成ssh密钥，用于免密登录
+ create_ssh() { 
+ echo "-------免密登录-------"
+ if [ ! -f ~/.ssh/id_rsa ];then
+     echo "-------生成ssh密钥-------"
+     ssh-keygen -t rsa
+     expect -c"
+      expect {
+          "*.ssh/id_rsa*" {send "\r";exp_continue}
+          "*empty for no passphrase:*" {send "\r";exp_continue}
+          "*fingerprint is:*" {send "\r";exp_continue}
+     }"
+     echo "-------分发密钥-------"
+     for host in hdp101 hdp102 hdp103
+     do 
+     ssh-copy-id $host
+     done
+ else
+     echo "-------id_rsa已存在，直接分发-------"
+     for host in hdp101 hdp102 hdp103
+     do 
+     ssh-copy-id $host
+     done
+ fi
+ }
+ 
+ 
+ # hadoop配置脚本
+ hadoop_config() { 
+     cd /opt/module/hadoop330/etc/hadoop
+     # 配置hadoop-env.sh文件
+     sed -i '25c export JAVA_HOME=/opt/module/jdk8' hadoop-env.sh
+     echo "-------配置hadoop-env.sh文件完成------"
+ 
+     # 配置core-site.xml文件 root是用户名，可更改
+     sed -i '19a <property>' core-site.xml
+     sed -i '20a <name>fs.defaultFS</name>' core-site.xml
+     sed -i '21a <value>hdfs://hdp101:8020</value>' core-site.xml
+     sed -i '22a </property>' core-site.xml
+     sed -i '23a <property>' core-site.xml
+     sed -i '24a <name>hadoop.data.dir</name>' core-site.xml
+     sed -i '25a <value>/opt/module/hadoop330/data</value>' core-site.xml
+     sed -i '26a </property>' core-site.xml
+     sed -i '27a <property>' core-site.xml
+     sed -i '28a <name>hadoop.proxyuser.root.groups</name>' core-site.xml
+     sed -i '29a <value>*</value>' core-site.xml
+     sed -i '30a </property>' core-site.xml
+     sed -i '31a <property>' core-site.xml
+     sed -i '32a <name>hadoop.proxyuser.root.hosts</name>' core-site.xml
+     sed -i '33a <value>*</value>' core-site.xml
+     sed -i '34a </property>' core-site.xml
+     echo "-------配置core-site.xml文件完成-------"
+ 
+     # 配置hdfs-site.xml文件
+     sed -i '19a <property>' hdfs-site.xml
+     sed -i '20a <name>dfs.namenode.secondary.http-address</name>' hdfs-site.xml
+     sed -i '21a <value>hdp103:9868</value>' hdfs-site.xml
+     sed -i '22a </property>' hdfs-site.xml
+     sed -i '23a <property>' hdfs-site.xml
+     sed -i '24a <name>dfs.namenode.name.dir</name>' hdfs-site.xml
+     sed -i '25a <value>file://${hadoop.data.dir}/name</value>' hdfs-site.xml
+     sed -i '26a </property>' hdfs-site.xml
+     sed -i '27a <property>' hdfs-site.xml
+     sed -i '28a <name>dfs.datanode.data.dir</name>' hdfs-site.xml
+     sed -i '29a <value>file://${hadoop.data.dir}/data</value>' hdfs-site.xml
+     sed -i '30a </property>' hdfs-site.xml
+     sed -i '31a <property>' hdfs-site.xml
+     sed -i '32a <name>dfs.namenode.checkpoint.dir</name>' hdfs-site.xml
+     sed -i '33a <value>file://${hadoop.data.dir}/namesecondary</value>' hdfs-site.xml
+     sed -i '34a </property>' hdfs-site.xml
+     sed -i '35a <property>' hdfs-site.xml
+     sed -i '36a <name>dfs.client.datanode-restart.timeout</name>' hdfs-site.xml
+     sed -i '37a <value>30</value>' hdfs-site.xml
+     sed -i '38a </property>' hdfs-site.xml
+     sed -i '39a <property>' hdfs-site.xml
+     sed -i '40a <name>dfs.namenode.http-address</name>' hdfs-site.xml
+     sed -i '41a <value>hadoop101:9870</value>' hdfs-site.xml
+     sed -i '42a </property>' hdfs-site.xml
+     echo "-------配置hdfs-site.xml文件完成-------"
+     
+     # 配置yarn-site.xml文件
+     sed -i '18a <property>' yarn-site.xml
+     sed -i '19a <name>yarn.resourcemanager.hostname</name>' yarn-site.xml
+     sed -i '20a <value>hdp102</value>' yarn-site.xml
+     sed -i '21a </property>' yarn-site.xml
+     sed -i '22a <property>' yarn-site.xml
+     sed -i '23a <name>yarn.nodemanager.aux-services</name>' yarn-site.xml
+     sed -i '24a <value>mapreduce_shuffle</value>' yarn-site.xml
+     sed -i '25a </property>' yarn-site.xml
+     sed -i '26a <property>' yarn-site.xml
+     sed -i '27a <name>yarn.nodemanager.env-whitelist</name>' yarn-site.xml
+     sed -i '28a <value>JAVA_HOME,HADOOP_COMMON_HOME,HADOOP_HDFS_HOME,HADOOP_CONF_DIR,CLASSPATH_PREPEND_DISTCACHE,HADOOP_YARN_HOME,HADOOP_MAPRED_HOME</value>' yarn-site.xml
+     sed -i '29a </property>' yarn-site.xml
+     echo "-------配置yarn-site.xml文件完成-------"
+ 
+     # 配置mapred-site.xml
+     sed -i '20a <property>' mapred-site.xml
+     sed -i '21a <name>mapreduce.framework.name</name>' mapred-site.xml
+     sed -i '22a <value>yarn</value>' mapred-site.xml
+     sed -i '23a </property>' mapred-site.xml
+     echo "-------配置mapred-site.xml文件完成-------"
+ 
+     # 配置workers
+     sed -i '2a hdp101' workers
+     sed -i '3a hdp102' workers
+     sed -i '4a hdp103' workers
+     echo "-------配置workers文件完成-------"
+     
+     # 配置hadoop-env.sh
+     sed -i '26a export HDFS_NAMENODE_USER=root' hadoop-env.sh
+     sed -i '27a export HDFS_SECONDARYNAMENODE_USER=root' hadoop-env.sh
+     sed -i '28a export HDFS_DATANODE_USER=root' hadoop-env.sh
+     echo "-------配置hadoop-env.sh文件完成-------"
+     
+     cd /opt/module/hadoop330/sbin
+     sed -i '2a HDFS_DATANODE_USER=root' start-dfs.sh
+     sed -i '3a HDFS_DATANODE_SECURE_USER=hdfs' start-dfs.sh
+     sed -i '4a HDFS_NAMENODE_USER=root' start-dfs.sh
+     sed -i '5a HDFS_SECONDARYNAMENODE_USER=root' start-dfs.sh
+     echo "-------配置start-dfs.sh文件完成-------"
+     
+     sed -i '2a HDFS_DATANODE_USER=root' stop-dfs.sh
+     sed -i '3a HDFS_DATANODE_SECURE_USER=hdfs' stop-dfs.sh
+     sed -i '4a HDFS_NAMENODE_USER=root' stop-dfs.sh
+     sed -i '5a HDFS_SECONDARYNAMENODE_USER=root' stop-dfs.sh
+     echo "-------配置stop-dfs.sh文件完成-------"
+     
+     sed -i '2a YARN_RESOURCEMANAGER_USER=root' start-yarn.sh
+     sed -i '3a HDFS_DATANODE_SECURE_USER=yarn' start-yarn.sh
+     sed -i '4a YARN_NODEMANAGER_USER=root' start-yarn.sh
+     echo "-------配置start-yarn.sh文件完成-------"
+     
+     sed -i '2a YARN_RESOURCEMANAGER_USER=root' stop-yarn.sh
+     sed -i '3a HDFS_DATANODE_SECURE_USER=yarn' stop-yarn.sh
+     sed -i '4a YARN_NODEMANAGER_USER=root' stop-yarn.sh
+     echo "-------配置stop-yarn.sh文件完成-------"
+     # 格式化namenode并启动hadoop
+     hadoop namenode -format
+     echo "-------格式化namenode完成-------"
+ }
+  
+ # hadoop集群启动
+ hadoop_start() { 
+     echo "-------hadoop集群启动-------"
+     echo " --------------- 启动 hdfs ---------------"
+     ssh hdp101 "/opt/module/hadoop330/sbin/start-dfs.sh"
+     echo " --------------- 启动 yarn ---------------"
+     ssh hdp102 "/opt/module/hadoop330/sbin/start-yarn.sh"
+     echo " --------------- 启动 historyserver ---------------"
+     ssh hdp102 "/opt/module/hadoop330/bin/mapred --daemon start historyserver"
+ }
+ # hadoop集群停止
+ hadoop_stop() { 
+     echo "-------hadoop集群停止-------"
+     echo " --------------- 关闭 historyserver ---------------"
+     ssh hdp102 "/opt/module/hadoop330/bin/mapred --daemon stop historyserver"
+     echo " --------------- 关闭 yarn ---------------"
+     ssh hdp102 "/opt/module/hadoop330/sbin/stop-yarn.sh"
+     echo " --------------- 关闭 hdfs ---------------"
+     ssh hdp101 "/opt/module/hadoop330/sbin/stop-dfs.sh"
+ }
+ # 分发脚本
+ xsync() { 
+     # 获取输入参数个数，如果没有参数，直接退出
+     pcount=$#
+     if((pcount==0)); then
+             echo no args...;
+             exit;
+     fi
+     # 获取文件名称
+     pname=$1
+     fname=`basename $pname`
+     echo fname=$fname
+     # 获取上级目录到绝对路径
+     pdir=`cd -P $(dirname $pname); pwd`
+     echo pdir=$pdir
+     # 获取当前用户名称
+     user=`whoami`
+     # 循环
+     for((host=2; host<=3; host++)); do
+             echo $pdir/$fname $user@hdp10$host:$pdir
+             echo ==================hdp10$host==================
+             rsync -rvl $pdir/$fname $user@hdp10$host:$pdir
+     done
+     #Note:这里的slave对应自己主机名，需要做相应修改。另外，for循环中的host的边界值
+ }
+ 
+ #安装mysql5.7
+ setup_mysql() { 
+     #检查linux的mariadb是否卸载 如果没有说明没有安装过mysql
+     mdb=`rpm -qa | grep mariadb`
+     if [ "$mdb" != "" ];then
+         rpm -e --nodeps $mdb
+         cd /opt/
+         wget -i -c http://dev.mysql.com/get/mysql57-community-release-el7-10.noarch.rpm
+         yum -y install mysql57-community-release-el7-10.noarch.rpm
+         yum -y install mysql-community-server
+         #修改/etc/my.cnf文件解决中文乱码
+         sed -i '/socket/a character-set-server=utf8' /etc/my.cnf
+         echo "[client]" >> /etc/my.cnf
+         echo "default-character-set=utf8" >> /etc/my.cnf
+         echo "[mysql]" >> /etc/my.cnf
+         echo "default-character-set=utf8" >> /etc/my.cnf
+         systemctl start  mysqld.service
+         #获取临时密码
+         pwdinfo=`grep "password" /var/log/mysqld.log| grep -wF "temporary password"`
+         passwd=${pwdinfo#*localhost:}
+         passwd=$(echo $passwd)
+         #执行修改密码语句
+         mysql -uroot -p$passwd --connect-expired-password -e "set global validate_password_policy=0"
+         mysql -uroot -p$passwd --connect-expired-password -e "set global validate_password_length=1"
+         mysql -uroot -p$passwd --connect-expired-password -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'okok'"
+         #修改远程登录
+         mysql -uroot -pokok -e "GRANT ALL PRIVILEGES ON *.* TO root@'%' IDENTIFIED BY 'okok'"
+         mysql -uroot -pokok -e "flush privileges"
+         #重启服务
+         systemctl restart mysqld.service
+     fi
+ }
+
+ #根据用户的选择进行对应的安装
+ custom_option() { 
+ case $1 in 
+     0)
+         install_package
+         ;;
+     1)
+         add_user
+         ;;
+     2)
+         modify_sysname $2 $3
+         modify_staticip $3
+         ;;
+     3)
+         close_firewalld
+         ;;
+     4)
+         modify_yumsource
+         ;;
+     5)
+         setup_jdk
+         ;;
+     6)
+         setup_hadoop
+         ;;
+     7)
+         setup_mysql
+         ;;
+     8)
+         create_ssh
+         ;;
+     9)
+         hadoop_config
+         ;;
+     10)
+         hadoop_start
+         ;;
+     11)
+         hadoop_stop
+         ;;
+     12)
+         xsync
+         ;;
+     98)
+         install_package
+         modify_sysname $2 $3
+         modify_staticip $3
+         modify_syshosts
+         close_firewalld
+         ;;
+     99)
+         setup_jdk
+         setup_hadoop
+         hadoop_config
+         ;;
+     *)
+      echo "please option 1~12、98、99"
+ esac
+ }
